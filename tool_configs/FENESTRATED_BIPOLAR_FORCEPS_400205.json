@@ -1,0 +1,75 @@
+/* -*- Mode: Javascript; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+{
+    // see dVRK user guide
+    "DH": {
+        "convention": "modified",
+        "joints": [
+            {
+                "name": "roll",
+                "alpha":  0.0000, "A":  0.0000, "theta":  0.0000, "D":  0.4162,
+                "type": "revolute",
+                "mode": "active",
+                "offset":  0.0000,
+                "qmin": -4.4506, // -255 degrees
+                "qmax":  4.4506, //  255 degrees
+                "ftmax": 0.33
+            },
+            {
+                "name": "wrist_pitch",
+                "alpha": -1.5708, "A":  0.0000, "theta":  0.0000, "D":  0.0000,
+                "type": "revolute",
+                "mode": "active",
+                "offset": -1.5708,
+                "qmin": -1.2217, // -70 degrees
+                "qmax":  1.2217, //  70 degrees
+                "ftmax": 0.25
+            },
+            {
+                "name": "wrist_yaw",
+                "alpha": -1.5708, "A":  0.0107, "theta":  0.0000, "D":  0.0000,
+                "type": "revolute",
+                "mode": "active",
+                "offset": -1.5708,
+                "qmin": -1.5708, // -90 degrees
+                "qmax":  1.5708, //  90 degrees
+                "ftmax": 0.20
+            }
+        ]
+    }
+    ,
+    "jaw" : {
+        // Overridden for this hand's actual differential-disk mechanism
+        // (not the ISI cable-driven jaw values), verified by manual ramp
+        // tests on hardware:
+        //  - open side: no stall up to -200 deg (test ceiling, not a
+        //    confirmed hard stop -- there may be more room than this)
+        //  - close side: dynamixel_controller_node's current-sensing safety
+        //    tripped ("Motor 3 limit hit") 2-4 deg past 80, so 80 is right
+        //    at the edge of the validated-safe range
+        "qmin": -3.490659, // -200 degrees - verified open limit
+        "qmax":  1.396260, //   80 degrees - verified close limit (near stall)
+        "ftmax": 0.19
+    }
+    ,
+    // rotation to match ISI convention (for read-only research API on commercial da Vinci)
+    "tooltip_offset" : [[ 0.0, -1.0,  0.0,  0.0],
+                        [ 0.0,  0.0,  1.0,  0.0],
+                        [-1.0,  0.0,  0.0,  0.0],
+                        [ 0.0,  0.0,  0.0,  1.0]]
+    ,
+    // values from the dVRK user guide, see tool appendix C, ISI numbers rounded to 6 digits
+    "coupling" : {
+        "ActuatorToJointPosition" : [[ -1.563233,  0.000000,  0.000000,  0.000000],
+                                     [  0.000000,  1.000000,  0.000000,  0.000000],
+                                     [  0.000000, -0.630273,  0.457982,  0.457982],
+                                     [  0.000000,  0.000000, -0.915964,  0.915964]]
+    }
+    ,
+    // angles used to engage the tool, in radians
+    // make sure these are within the range of motion IN the cannula
+    // max range on roll, 10, 10, 0 degrees
+    "tool_engage_position" : {
+        "lower" : [-4.5378, -0.174533, -0.174533, 0.0],
+        "upper" : [ 4.5378,  0.174533,  0.174533, 0.0]
+    }
+}

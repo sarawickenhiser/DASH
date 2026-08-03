@@ -1,0 +1,12 @@
+{
+    "4E AC 98 6E": {
+        "name": "MARYLAND_BIPOLAR_FORCEPS",
+        "config": "MARYLAND_BIPOLAR_FORCEPS_400172.json"
+    },
+
+    "F4 03 0A E3": {
+        "name": "FENESTRATED_BIPOLAR_FORCEPS",
+        "config": "FENESTRATED_BIPOLAR_FORCEPS_400205.json"
+    }
+
+}
