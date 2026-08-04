@@ -48,22 +48,103 @@ def quat_inverse(q):
     x, y, z, w = q
     return np.array([-x, -y, -z, w])
 
-def quat_to_euler(q):
-    """Convert quaternion [x, y, z, w] to roll, pitch, yaw (radians)."""
-    x, y, z, w = q
-    # Roll (x-axis)
-    sinr_cosp = 2 * (w * x + y * z)
-    cosr_cosp = 1 - 2 * (x * x + y * y)
-    roll = math.atan2(sinr_cosp, cosr_cosp)
-    # Pitch (y-axis)
-    sinp = 2 * (w * y - z * x)
-    sinp = max(-1.0, min(1.0, sinp))
-    pitch = math.asin(sinp)
-    # Yaw (z-axis)
-    siny_cosp = 2 * (w * z + x * y)
-    cosy_cosp = 1 - 2 * (y * y + z * z)
-    yaw = math.atan2(siny_cosp, cosy_cosp)
-    return roll, pitch, yaw
+# Superseded by swing_twist() + quat_to_rotvec() below. Kept for reference and
+# for the rviz/debug path: a ZYX decomposition is singular at pitch = 90 deg,
+# uncomfortably close to this tool's 79 deg pitch limit, and it couples roll
+# into pitch/yaw -- both of which the swing-twist split avoids.
+#
+# def quat_to_euler(q):
+#     """Convert quaternion [x, y, z, w] to roll, pitch, yaw (radians)."""
+#     x, y, z, w = q
+#     # Roll (x-axis)
+#     sinr_cosp = 2 * (w * x + y * z)
+#     cosr_cosp = 1 - 2 * (x * x + y * y)
+#     roll = math.atan2(sinr_cosp, cosr_cosp)
+#     # Pitch (y-axis)
+#     sinp = 2 * (w * y - z * x)
+#     sinp = max(-1.0, min(1.0, sinp))
+#     pitch = math.asin(sinp)
+#     # Yaw (z-axis)
+#     siny_cosp = 2 * (w * z + x * y)
+#     cosy_cosp = 1 - 2 * (y * y + z * z)
+#     yaw = math.atan2(siny_cosp, cosy_cosp)
+#     return roll, pitch, yaw
+
+def quat_normalize(q):
+    return q / np.linalg.norm(q)
+
+def quat_canonical(q):
+    """Force w >= 0 so interpolation always takes the short way round."""
+    return -q if q[3] < 0.0 else q
+
+def quat_from_rotvec(v):
+    """Rotation vector (axis * angle, radians) -> quaternion [x, y, z, w]."""
+    theta = float(np.linalg.norm(v))
+    if theta < 1e-12:
+        return np.array([0.0, 0.0, 0.0, 1.0])
+    axis = v / theta
+    s = math.sin(theta / 2.0)
+    return np.array([axis[0]*s, axis[1]*s, axis[2]*s, math.cos(theta / 2.0)])
+
+def quat_to_rotvec(q):
+    """Quaternion -> rotation vector. Inverse of quat_from_rotvec."""
+    q = quat_canonical(quat_normalize(q))
+    w = max(-1.0, min(1.0, float(q[3])))
+    s = math.sqrt(max(0.0, 1.0 - w*w))
+    if s < 1e-8:          # angle ~ 0; axis is meaningless and magnitude is too
+        return np.zeros(3)
+    return (q[:3] / s) * (2.0 * math.acos(w))
+
+def quat_slerp(q0, q1, t):
+    """Interpolate along the shortest geodesic between two orientations."""
+    q0 = quat_normalize(q0)
+    q1 = quat_normalize(q1)
+    d = float(np.dot(q0, q1))
+    if d < 0.0:           # opposite hemisphere: negate so we take the short arc
+        q1 = -q1
+        d = -d
+    d = max(-1.0, min(1.0, d))
+    if d > 0.9995:        # nearly identical; slerp is ill-conditioned, lerp suffices
+        return quat_normalize(q0 + t * (q1 - q0))
+    theta = math.acos(d) * t
+    q_perp = quat_normalize(q1 - q0 * d)
+    return q0 * math.cos(theta) + q_perp * math.sin(theta)
+
+def quat_angle_between(q0, q1):
+    """Geodesic angle (radians) between two orientations, always in [0, pi]."""
+    d = abs(float(np.dot(quat_normalize(q0), quat_normalize(q1))))
+    return 2.0 * math.acos(min(1.0, d))
+
+def swing_twist(q, axis):
+    """
+    Split q into (swing, twist) about `axis`, such that q = swing * twist.
+
+    twist is the rotation about `axis` (the tool's roll); swing is everything
+    else, and its axis is perpendicular to `axis` by construction -- so swing
+    carries exactly two degrees of freedom and maps onto pitch/yaw with no
+    third angle leaking in. Unlike a ZYX decomposition this has no singularity
+    anywhere near the tool's 79 deg pitch limit; it only degenerates when the
+    swing reaches 180 deg, far outside any reachable bound.
+    """
+    proj = float(np.dot(q[:3], axis)) * axis
+    twist = np.array([proj[0], proj[1], proj[2], q[3]])
+    n = float(np.linalg.norm(twist))
+    if n < 1e-8:          # 180 deg swing: twist is undefined, call it zero
+        return quat_normalize(q), np.array([0.0, 0.0, 0.0, 1.0])
+    twist = twist / n
+    return quat_multiply(q, quat_inverse(twist)), twist
+
+def twist_angle(twist, axis):
+    """Signed rotation angle of a pure-twist quaternion, wrapped to [-pi, pi]."""
+    twist = quat_canonical(twist)
+    return 2.0 * math.atan2(float(np.dot(twist[:3], axis)), float(twist[3]))
+
+def wrap_to_pi(angle):
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+# Tool roll axis in the reference-relative frame.
+ROLL_AXIS = np.array([1.0, 0.0, 0.0])
+IDENTITY_QUAT = np.array([0.0, 0.0, 0.0, 1.0])
 
 class QuestTeleopNode(Node):
     def __init__(self):
@@ -107,6 +188,15 @@ class QuestTeleopNode(Node):
             self.get_parameter('roll_stick_deadband').value
         )
 
+        # 'quaternion': roll comes from the twist component of the hand's
+        #   rotation, so all three axes track orientation directly. The
+        #   swing-twist split keeps it from coupling into pitch/yaw, which is
+        #   what made the Euler version unusable and motivated the thumbstick.
+        # 'thumbstick': previous behaviour, kept as a fallback -- roll is rate
+        #   controlled and hand roll is ignored entirely.
+        self.declare_parameter('roll_source', 'quaternion')
+        self.roll_source = str(self.get_parameter('roll_source').value)
+
         self.max_roll  = math.radians(self.get_parameter('max_roll_deg').value)
         self.max_pitch = math.radians(self.get_parameter('max_pitch_deg').value)
         self.max_yaw   = math.radians(self.get_parameter('max_yaw_deg').value)
@@ -119,8 +209,17 @@ class QuestTeleopNode(Node):
 
         # State
         self.ref_quat     = None   # reference quaternion (zero pose)
-        # Rate-limited/clamped joint targets, tracked independently per axis
-        # (not as a single SO(3) rotation -- see pose_callback for why).
+        # Rate-limited/clamped target, tracked as a single SO(3) rotation and
+        # decomposed to joint angles only at publish time. Interpolating here
+        # rather than per-axis means a diagonal move follows the geodesic and
+        # respects max_angular_speed as a true angular rate, instead of each
+        # axis independently stepping at that rate.
+        self.current_quat = IDENTITY_QUAT.copy()
+        # Roll is unwrapped across the +-180 deg quaternion branch cut so the
+        # tool can reach its full +-255 deg continuous-rotation range; a
+        # quaternion alone cannot distinguish +200 deg from -160 deg.
+        self.unwrapped_roll = 0.0
+        self.prev_roll_raw  = None
         self.current_roll  = 0.0
         self.current_pitch = 0.0
         self.current_yaw   = 0.0
@@ -201,6 +300,9 @@ class QuestTeleopNode(Node):
         # clutch below.
         if self.ref_quat is None or self.home_reset_requested:
             self.ref_quat = ros_quat.copy()
+            self.current_quat = IDENTITY_QUAT.copy()
+            self.unwrapped_roll = 0.0
+            self.prev_roll_raw = None
             self.current_roll = 0.0
             self.current_pitch = 0.0
             self.current_yaw = 0.0
@@ -232,45 +334,108 @@ class QuestTeleopNode(Node):
         rel_quat = quat_multiply(quat_inverse(self.ref_quat), ros_quat)
         rel_quat = rel_quat / np.linalg.norm(rel_quat)
 
-        # Extract pitch/yaw and treat them as independent scalar channels
-        # (roll is intentionally not derived from hand orientation -- see
-        # the thumbstick handling below).
-        _unused_roll, raw_pitch, raw_yaw = quat_to_euler(rel_quat)
+        # --- Previous per-axis Euler pipeline, superseded by the SO(3) one
+        # --- below. Kept for reference / quick revert.
+        #
+        # # Extract pitch/yaw and treat them as independent scalar channels
+        # # (roll is intentionally not derived from hand orientation -- see
+        # # the thumbstick handling below).
+        # _unused_roll, raw_pitch, raw_yaw = quat_to_euler(rel_quat)
+        #
+        # target_pitch = raw_pitch * self.motion_scale
+        # target_yaw   = raw_yaw * self.motion_scale
+        #
+        # # Rate-limit each axis independently, and clamp to joint limits
+        # # in-place (not just on the published value) so the internal
+        # # tracker never "winds up" past the limit -- otherwise reversing
+        # # direction after saturating would lag until the internal value
+        # # ratchets back within range.
+        # max_step = self.max_angular_speed * dt
+        #
+        # self.current_pitch = self.clamp(
+        #     self.step_value(self.current_pitch, target_pitch, max_step),
+        #     -self.max_pitch, self.max_pitch
+        # )
+        # self.current_yaw = self.clamp(
+        #     self.step_value(self.current_yaw, target_yaw, max_step),
+        #     -self.max_yaw, self.max_yaw
+        # )
+        #
+        # # Roll: driven directly by the thumbstick as a rate control, with a
+        # # deadband so a resting stick that isn't exactly zero doesn't drift.
+        # stick = self.roll_stick
+        # if abs(stick) < self.roll_stick_deadband:
+        #     stick = 0.0
+        # self.current_roll = self.clamp(
+        #     self.current_roll + stick * self.roll_stick_speed * dt,
+        #     -self.max_roll, self.max_roll
+        # )
 
-        target_pitch = raw_pitch * self.motion_scale
-        target_yaw   = raw_yaw * self.motion_scale
-
-        # Rate-limit each axis independently, and clamp to joint limits
-        # in-place (not just on the published value) so the internal
-        # tracker never "winds up" past the limit -- otherwise reversing
-        # direction after saturating would lag until the internal value
-        # ratchets back within range.
         now = self.get_clock().now()
         if self.last_pose_time is None:
             dt = 0.0
         else:
             dt = (now - self.last_pose_time).nanoseconds * 1e-9
         self.last_pose_time = now
+
+        # Scale the operator's rotation by slerping out from identity, which
+        # shrinks the rotation angle and leaves its axis untouched.
+        q_target = quat_slerp(IDENTITY_QUAT, rel_quat, self.motion_scale)
+
+        # Rate-limit along the geodesic: one angular speed cap for the whole
+        # rotation rather than one per axis, so a diagonal move no longer
+        # exceeds max_angular_speed or bows off the shortest path.
         max_step = self.max_angular_speed * dt
+        angle = quat_angle_between(self.current_quat, q_target)
+        if angle <= max_step or angle < 1e-9:
+            self.current_quat = q_target
+        else:
+            self.current_quat = quat_slerp(
+                self.current_quat, q_target, max_step / angle
+            )
 
-        self.current_pitch = self.clamp(
-            self.step_value(self.current_pitch, target_pitch, max_step),
-            -self.max_pitch, self.max_pitch
-        )
-        self.current_yaw = self.clamp(
-            self.step_value(self.current_yaw, target_yaw, max_step),
-            -self.max_yaw, self.max_yaw
-        )
+        # Decompose once, at the last point before the joint command.
+        swing, twist = swing_twist(self.current_quat, ROLL_AXIS)
+        rotvec = quat_to_rotvec(swing)
+        pitch, yaw = float(rotvec[1]), float(rotvec[2])
 
-        # Roll: driven directly by the thumbstick as a rate control, with a
-        # deadband so a resting stick that isn't exactly zero doesn't drift.
-        stick = self.roll_stick
-        if abs(stick) < self.roll_stick_deadband:
-            stick = 0.0
-        self.current_roll = self.clamp(
-            self.current_roll + stick * self.roll_stick_speed * dt,
-            -self.max_roll, self.max_roll
-        )
+        if self.roll_source == 'thumbstick':
+            # Fallback: ignore hand roll entirely, integrate the stick as a rate.
+            stick = self.roll_stick
+            if abs(stick) < self.roll_stick_deadband:
+                stick = 0.0
+            self.unwrapped_roll += stick * self.roll_stick_speed * dt
+        else:
+            # Track hand roll from the twist component, unwrapping across the
+            # +-180 deg branch cut so the tool's full +-255 deg range stays
+            # reachable -- a quaternion cannot tell +200 deg from -160 deg.
+            roll_raw = twist_angle(twist, ROLL_AXIS)
+            if self.prev_roll_raw is None:
+                self.unwrapped_roll = roll_raw
+            else:
+                self.unwrapped_roll += wrap_to_pi(roll_raw - self.prev_roll_raw)
+            self.prev_roll_raw = roll_raw
+
+        # Clamp in joint space -- the limits are mechanical, so this is the one
+        # place they legitimately apply.
+        roll  = self.clamp(self.unwrapped_roll, -self.max_roll, self.max_roll)
+        pitch = self.clamp(pitch, -self.max_pitch, self.max_pitch)
+        yaw   = self.clamp(yaw, -self.max_yaw, self.max_yaw)
+
+        # Fold the clamped result back into the tracked rotation. Without this
+        # the quaternion keeps integrating past what the tool can reach, and
+        # reversing direction lags until it unwinds -- the same wind-up the
+        # per-axis version guarded against, just harder to see in SO(3).
+        self.unwrapped_roll = roll
+        swing_c = quat_from_rotvec(np.array([0.0, pitch, yaw]))
+        twist_c = quat_from_rotvec(ROLL_AXIS * roll)
+        self.current_quat = quat_normalize(quat_multiply(swing_c, twist_c))
+        if self.roll_source != 'thumbstick':
+            self.prev_roll_raw = wrap_to_pi(roll)
+
+        self.current_roll  = roll
+        self.current_pitch = pitch
+        self.current_yaw   = yaw
 
         roll  = self.current_roll
         pitch = self.current_pitch
