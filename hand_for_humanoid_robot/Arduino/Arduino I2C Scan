@@ -1,0 +1,39 @@
+#include <Wire.h>
+
+void setup() {
+  Serial.begin(115200);
+
+  while (!Serial) {
+    delay(10);
+  }
+
+  Serial.println("I2C scanner starting...");
+  Wire.begin();
+}
+
+void loop() {
+  int devices = 0;
+
+  for (byte address = 8; address < 120; address++) {
+    Wire.beginTransmission(address);
+    byte error = Wire.endTransmission();
+
+    if (error == 0) {
+      Serial.print("I2C device found at 0x");
+
+      if (address < 16) {
+        Serial.print("0");
+      }
+
+      Serial.println(address, HEX);
+      devices++;
+    }
+  }
+
+  if (devices == 0) {
+    Serial.println("No normal I2C devices found.");
+  }
+
+  Serial.println("Scan done.");
+  delay(2000);
+}

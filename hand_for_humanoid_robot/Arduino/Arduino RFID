@@ -1,0 +1,68 @@
+#include <Wire.h>
+#include <PN532_I2C.h>
+#include <PN532.h>
+
+PN532_I2C pn532_i2c(Wire);
+PN532 nfc(pn532_i2c);
+
+void setup() {
+  Serial.begin(115200);
+
+  while (!Serial) {
+    delay(10);
+  }
+
+  Serial.println("PN532 I2C UID Reader");
+  Serial.println("Starting Wire...");
+  Wire.begin();
+
+  Serial.println("Starting PN532...");
+  nfc.begin();
+
+  Serial.println("Checking firmware...");
+  uint32_t versiondata = nfc.getFirmwareVersion();
+
+  if (!versiondata) {
+    Serial.println("ERROR: PN532 not found.");
+    Serial.println("Check wiring, I2C switch setting, power, and solder joints.");
+    while (1) {
+      delay(100);
+    }
+  }
+
+  Serial.print("Found PN532. Firmware version: ");
+  Serial.print((versiondata >> 16) & 0xFF, DEC);
+  Serial.print(".");
+  Serial.println((versiondata >> 8) & 0xFF, DEC);
+
+  Serial.println("Running SAMConfig...");
+  nfc.SAMConfig();
+
+  Serial.println("READY_TO_SCAN");
+}
+
+void loop() {
+  uint8_t uid[7];
+  uint8_t uidLength;
+
+  bool success = nfc.readPassiveTargetID(
+    PN532_MIFARE_ISO14443A,
+    uid,
+    &uidLength
+  );
+
+  if (success) {
+    Serial.print("UID:");
+
+    for (uint8_t i = 0; i < uidLength; i++) {
+      if (uid[i] < 0x10) {
+        Serial.print("0");
+      }
+
+      Serial.print(uid[i], HEX);
+    }
+
+    Serial.println();
+    delay(1000);
+  }
+}
