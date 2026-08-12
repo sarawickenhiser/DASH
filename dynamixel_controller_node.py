@@ -38,11 +38,11 @@ class DynamixelControllerNode(Node):
         # Home positions should match your auto-zero home positions.
         self.declare_parameter('home_positions', [2048, 2048, 1024, 1024])
 
-        # Actual operation speed.
-        self.declare_parameter('command_speed_deg_per_sec', 50.0)
+        # Actual operation speed per motor
+        self.declare_parameter('command_speed_deg_per_sec', 180.0)
 
         # Dynamixel internal profile velocity.
-        self.declare_parameter('profile_velocity', 80)
+        self.declare_parameter('profile_velocity', 110)
 
         # Motion update rate.
         self.declare_parameter('control_period_sec', 0.02)
@@ -50,6 +50,11 @@ class DynamixelControllerNode(Node):
         # Start enabled after auto-zero/manual launch.
         # Set false if you want to require /h4hr/enable_control true.
         self.declare_parameter('start_enabled', True)
+
+        # On startup, read where the motors actually are and drive smoothly to
+        # the zero pose, instead of needing the separate auto_zero_node.
+        # Set false to hold the current pose on boot instead.
+        self.declare_parameter('go_to_zero_on_start', True)
 
         # Joint limits.
         self.declare_parameter('max_roll_deg', 259.0)
@@ -59,9 +64,16 @@ class DynamixelControllerNode(Node):
         # Generic fallback gripper range, used until a tool is scanned via
         # RFID and /h4hr/update_limits provides the real per-tool range.
         # Current mechanical setup:
-        #   open  = -15 deg
+        #   open  = -200 deg
         #   close = 38 deg
-        self.declare_parameter('min_grip_deg', -15.0)
+        #
+        # Note the full -200 is only reachable near a neutral wrist. Grip and
+        # yaw share disks 3 and 4, so at max pitch AND max yaw together, a
+        # fully open grip drives D3 to ~200 deg against its 150 deg limit and
+        # validate_disk_angles() refuses the command. Roughly, the opening
+        # available shrinks from about -365 deg at zero yaw to about -207 deg
+        # at 79 deg of yaw.
+        self.declare_parameter('min_grip_deg', -200.0)
         self.declare_parameter('max_grip_deg', 38.0)
 
         self.device_name = self.get_parameter('device_name').value
@@ -194,6 +206,25 @@ class DynamixelControllerNode(Node):
 
         self.connect_to_motors()
 
+        # Seed the tracker from the real encoder positions. target_joint_deg is
+        # already all zeros, so once the control timer starts the existing loop
+        # walks the tool to the zero pose at command_speed_deg_per_sec, with the
+        # usual disk and bounds validation on every step -- no separate
+        # auto-zero pass, no prompts.
+        if bool(self.get_parameter('go_to_zero_on_start').value):
+            if self.sync_current_from_motors():
+                self.get_logger().warn(
+                    'Moving to ZERO pose on startup at '
+                    f'{self.command_speed_deg_per_sec:.0f} deg/s. '
+                    'Keep clear of the tool.'
+                )
+        else:
+            # Hold whatever pose we booted in: make target match reality so the
+            # loop has nothing to correct.
+            if self.sync_current_from_motors():
+                with self.state_lock:
+                    self.target_joint_deg = dict(self.current_joint_deg)
+
         # -----------------------------
         # ROS interfaces
         # -----------------------------
@@ -307,6 +338,26 @@ class DynamixelControllerNode(Node):
                 present = self.get_home_position(dxl_id)
 
             self.goal_positions[dxl_id] = present
+
+    def reopen_port(self):
+        """
+        Reopen the port after an RFID scan, without reconfiguring the motors.
+
+        Deliberately NOT connect_to_motors(): that calls
+        set_all_extended_position_mode(), which must disable torque to change
+        the operating mode. Doing that on every scan drops the tool under
+        gravity, which is exactly what leaving torque enabled in
+        release_port_callback() was meant to prevent. Operating mode and
+        profile velocity are stored on the servo and survive the port closing,
+        so there is nothing to re-apply -- only the host handle to rebuild.
+        """
+        if not self.port_handler.openPort():
+            raise RuntimeError(f'Failed to reopen port: {self.device_name}')
+
+        if not self.port_handler.setBaudRate(self.baudrate):
+            raise RuntimeError(f'Failed to set baudrate: {self.baudrate}')
+
+        self.port_handler.ser.timeout = 0.1
 
     def check_result(self, comm_result, dxl_error, action):
         if comm_result != COMM_SUCCESS:
@@ -525,6 +576,61 @@ class DynamixelControllerNode(Node):
             3: d3,
             4: d4,
         }
+
+    def disks_to_joints(self, disk_angles):
+        """
+        Forward coupling: disk angles -> joint angles. The exact inverse of
+        joints_to_disks(), straight off the dVRK coupling matrix.
+        """
+        d1 = disk_angles[1]
+        d2 = disk_angles[2]
+        d3 = disk_angles[3]
+        d4 = disk_angles[4]
+
+        return {
+            'roll': self.ROLL_D1 * d1,
+            'pitch': self.PITCH_D2 * d2,
+            'yaw': self.YAW_D2 * d2 + self.YAW_D3 * d3 + self.YAW_D4 * d4,
+            'grip': self.GRIP_D3 * d3 + self.GRIP_D4 * d4,
+        }
+
+    def sync_current_from_motors(self):
+        """
+        Seed current_joint_deg from where the motors physically are.
+
+        Without this the tracker starts at 0,0,0,0 no matter the real pose, so
+        the control loop believes it is already at zero: the first command then
+        steps from a fictional starting point and the tool lurches. Reading the
+        encoders back through the coupling makes the loop's idea of "current"
+        true, which is also what lets the go-to-zero-on-start below be a smooth
+        rate-limited move rather than a jump.
+        """
+        disk_angles = {}
+
+        for dxl_id in self.motor_ids:
+            present = self.read_present_position(dxl_id)
+
+            if present is None:
+                self.get_logger().error(
+                    f'Motor {dxl_id}: cannot read present position, so the '
+                    'startup pose is unknown. Holding instead of moving.'
+                )
+                return False
+
+            disk_angles[dxl_id] = self.motor_position_to_disk_angle(
+                dxl_id, present
+            )
+
+        joints = self.disks_to_joints(disk_angles)
+
+        with self.state_lock:
+            self.current_joint_deg = joints
+
+        self.get_logger().info(
+            f"Startup pose: R={joints['roll']:.1f}, P={joints['pitch']:.1f}, "
+            f"Y={joints['yaw']:.1f}, G={joints['grip']:.1f} deg"
+        )
+        return True
 
     def validate_disk_angles(self, disk_angles):
         for dxl_id, angle_deg in disk_angles.items():
@@ -823,17 +929,16 @@ class DynamixelControllerNode(Node):
     def release_port_callback(self, request, response):
         self.get_logger().info('Releasing serial port for RFID scan...')
         self.control_enabled = False
-    # Disable torque on all motors first
-        for dxl_id in self.motor_ids:
-            self.write_1_byte(
-            dxl_id,
-            self.ADDR_TORQUE_ENABLE,
-            self.TORQUE_DISABLE,
-            f'Torque off motor {dxl_id}'
-        )
-    # Close the port
+
+        # Torque is deliberately left ENABLED. Torque Enable is a register on
+        # the servo itself, so closing the host port does not affect it -- the
+        # motors keep holding their last goal position while the scanner has
+        # the port. Disabling it here made the tool go limp and sag under
+        # gravity on every scan, which is both unpleasant and unsafe with an
+        # instrument mounted. Stopping the control loop (above) is enough to
+        # guarantee we issue no writes while the port is closed.
         self.port_handler.closePort()
-        self.get_logger().info('Port released.')
+        self.get_logger().info('Port released (motors still holding).')
         response.success = True
         response.message = 'Port released'
         return response
@@ -841,7 +946,13 @@ class DynamixelControllerNode(Node):
     def reclaim_port_callback(self, request, response):
         self.get_logger().info('Reclaiming serial port...')
         try:
-            self.connect_to_motors()
+            self.reopen_port()
+            # Re-read where the motors actually are before resuming. They were
+            # holding under torque, but the tool can still be nudged by hand,
+            # and a stale current_joint_deg would make the loop step from a
+            # position the tool is not in -- the same wind-up this guards
+            # against at startup.
+            self.sync_current_from_motors()
             self.control_enabled = True
             self.get_logger().info('Port reclaimed, motors ready.')
             response.success = True
